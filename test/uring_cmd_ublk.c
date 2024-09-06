@@ -21,8 +21,15 @@
 
 #include "liburing.h"
 #include "helpers.h"
+
+#define IOSQE_GROUP_KBUF  IOSQE_IO_DRAIN
+
 #ifdef CONFIG_HAVE_UBLK_HEADER
 #include <linux/ublk_cmd.h>
+
+#ifndef UBLK_U_IO_PROVIDE_IO_BUF
+#define UBLK_U_IO_PROVIDE_IO_BUF	_IOWR('u', 0x23, struct ublksrv_io_cmd)
+#endif
 
 /****************** part 1: libublk ********************/
 
@@ -86,6 +93,7 @@ struct ublk_tgt {
 	unsigned int  cq_depth;
 	const struct ublk_tgt_ops *ops;
 	struct ublk_params params;
+	char backing_file[1024 - 8 - sizeof(struct ublk_params)];
 };
 
 struct ublk_queue {
@@ -100,6 +108,7 @@ struct ublk_queue {
 	struct ublk_io ios[UBLK_QUEUE_DEPTH];
 #define UBLKSRV_QUEUE_STOPPING	(1U << 0)
 #define UBLKSRV_QUEUE_IDLE	(1U << 1)
+#define UBLKSRV_USER_COPY	(1U << 2)
 	unsigned state;
 	pid_t tid;
 	pthread_t thread;
@@ -128,6 +137,17 @@ struct ublk_dev {
 
 #define round_up(val, rnd) \
 	(((val) + ((rnd) - 1)) & ~((rnd) - 1))
+
+/*
+ * Prep IO which is one member of sqe group, and buffer is provided by
+ * group leader, `buf_off` is the offset of provided buffer
+ */
+static inline void io_uring_prep_rw_group(int op, struct io_uring_sqe *sqe,
+					  int fd, unsigned buf_off,
+					  unsigned len, __u64 offset)
+{
+	io_uring_prep_rw(op, sqe, fd, (void *)(uintptr_t)buf_off, len, offset);
+}
 
 static unsigned int ublk_dbg_mask = 0;
 
@@ -426,6 +446,8 @@ static int ublk_queue_init(struct ublk_queue *q)
 	q->q_depth = depth;
 	q->cmd_inflight = 0;
 	q->tid = gettid();
+	if (dev->dev_info.flags & UBLK_F_USER_COPY)
+		q->state |= UBLKSRV_USER_COPY;
 
 	cmd_buf_size = ublk_queue_cmd_buf_sz(q);
 	off = UBLKSRV_CMD_BUF_OFFSET +
@@ -547,8 +569,11 @@ static int ublk_queue_io_cmd(struct ublk_queue *q,
 	sqe->flags	= IOSQE_FIXED_FILE;
 	sqe->rw_flags	= 0;
 	cmd->tag	= tag;
-	cmd->addr	= (__u64) (uintptr_t) io->buf_addr;
 	cmd->q_id	= q->q_id;
+	if (!(q->state & UBLKSRV_USER_COPY))
+		cmd->addr	= (__u64) (uintptr_t) io->buf_addr;
+	else
+		cmd->addr	= 0;
 
 	user_data = build_user_data(tag, _IOC_NR(cmd_op), 0, 0);
 	io_uring_sqe_set_data64(sqe, user_data);
@@ -850,7 +875,7 @@ static int ublk_stop_io_daemon(const struct ublk_dev *dev)
 }
 
 static int cmd_dev_add(char *tgt_type, int *exp_id, unsigned nr_queues,
-		       unsigned depth)
+		       unsigned depth, char *backing_file)
 {
 	const struct ublk_tgt_ops *ops;
 	struct ublksrv_ctrl_dev_info *info;
@@ -884,8 +909,20 @@ static int cmd_dev_add(char *tgt_type, int *exp_id, unsigned nr_queues,
         info->nr_hw_queues = nr_queues;
         info->queue_depth = depth;
 	dev->tgt.ops = ops;
-	dev->tgt.sq_depth = depth;
-	dev->tgt.cq_depth = depth;
+
+	/* sqe group and provide buffer is used for supporting ublk zc */
+	if (!strcmp(tgt_type, "loop"))
+		info->flags |= UBLK_F_SUPPORT_ZERO_COPY | UBLK_F_USER_COPY;
+
+	if (info->flags & UBLK_F_SUPPORT_ZERO_COPY) {
+		dev->tgt.sq_depth = depth * 2;
+		dev->tgt.cq_depth = depth * 2;
+	} else {
+		dev->tgt.sq_depth = depth;
+		dev->tgt.cq_depth = depth;
+	}
+	if (backing_file)
+		strcpy(dev->tgt.backing_file, backing_file);
 
 	ret = ublk_ctrl_add_dev(dev);
 	if (ret < 0) {
@@ -986,11 +1023,199 @@ static int ublk_null_queue_io(struct ublk_queue *q, int tag)
 	return 0;
 }
 
+static inline void ublk_get_sqe_pair(struct io_uring *r,
+		struct io_uring_sqe **sqe, struct io_uring_sqe **sqe2)
+{
+	unsigned left = io_uring_sq_space_left(r);
+
+	if (left < 2)
+		io_uring_submit(r);
+	*sqe = io_uring_get_sqe(r);
+	if (sqe2)
+		*sqe2 = io_uring_get_sqe(r);
+}
+
+static inline void io_uring_prep_grp_lead(struct io_uring_sqe *sqe,
+		int dev_fd, int tag, int q_id)
+{
+	struct ublksrv_io_cmd *cmd = (struct ublksrv_io_cmd *)sqe->cmd;
+
+	io_uring_prep_read(sqe, dev_fd, 0, 0, 0);
+	sqe->opcode		= IORING_OP_URING_CMD;
+	sqe->flags		|= IOSQE_CQE_SKIP_SUCCESS | IOSQE_GROUP_LINK |
+		IOSQE_FIXED_FILE;
+
+	/* every member sqe/io consumes this provided buffer */
+	sqe->cmd_op		= UBLK_U_IO_PROVIDE_IO_BUF;
+
+	cmd->tag	= tag;
+	cmd->addr	= 0;
+	cmd->q_id	= q_id;
+}
+
+static inline void ublk_uring_prep_rw_zc(struct ublk_queue *q,
+		int dev_fd, const struct ublksrv_io_desc *iod,
+		int tag, int q_id, int fd, unsigned op)
+{
+	unsigned ublk_op = ublksrv_get_op(iod);
+	unsigned len = iod->nr_sectors << 9;
+	__u64 off = iod->start_sector << 9;
+	struct io_uring_sqe *lead;
+	struct io_uring_sqe *mem;
+
+	q->io_inflight++;
+	ublk_get_sqe_pair(&q->ring, &lead, &mem);
+
+	io_uring_prep_grp_lead(lead, dev_fd, tag, q_id);
+	io_uring_prep_rw_group(op, mem, fd, 0, len, off);
+	io_uring_sqe_set_flags(mem, IOSQE_FIXED_FILE | IOSQE_GROUP_KBUF);
+	mem->user_data = build_user_data(tag, ublk_op, 0, 1);
+}
+
+static inline void ublk_uring_prep_flush(struct ublk_queue *q,
+		const struct ublksrv_io_desc *iod,
+		int tag, int q_id, int fd)
+{
+	unsigned ublk_op = ublksrv_get_op(iod);
+	struct io_uring_sqe *sqe;
+
+	sqe = io_uring_get_sqe(&q->ring);
+	io_uring_prep_sync_file_range(sqe, fd,
+			iod->nr_sectors << 9,
+			iod->start_sector << 9,
+			IORING_FSYNC_DATASYNC);
+	io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+	/* bit63 marks us as tgt io */
+	sqe->user_data = build_user_data(tag, ublk_op, 0, 1);
+	q->io_inflight++;
+}
+
+static int loop_queue_tgt_io(struct ublk_queue *q, int tag)
+{
+	const struct ublksrv_io_desc *iod = ublk_get_iod(q, tag);
+	unsigned ublk_op = ublksrv_get_op(iod);
+
+	switch (ublk_op) {
+	case UBLK_IO_OP_FLUSH:
+		ublk_uring_prep_flush(q,
+				iod,
+				tag,
+				q->q_id,
+				1	/*fds[1]*/
+				);
+		break;
+	case UBLK_IO_OP_WRITE_ZEROES:
+	case UBLK_IO_OP_DISCARD:
+		return -ENOTSUP;
+	case UBLK_IO_OP_READ:
+		ublk_uring_prep_rw_zc(q,
+				0, /* fds[0] */
+				iod,
+				tag,
+				q->q_id,
+				1,	/*fds[1]*/
+				IORING_OP_READ);
+		break;
+	case UBLK_IO_OP_WRITE:
+		ublk_uring_prep_rw_zc(q,
+				0, /* fds[0] */
+				iod,
+				tag,
+				q->q_id,
+				1,	/*fds[1]*/
+				IORING_OP_WRITE);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	ublk_dbg(UBLK_DBG_IO, "%s: tag %d ublk io %x %llx %u\n", __func__, tag,
+			iod->op_flags, iod->start_sector, iod->nr_sectors << 9);
+	return 1;
+}
+
+static int ublk_loop_queue_io(struct ublk_queue *q, int tag)
+{
+	int queued = loop_queue_tgt_io(q, tag);
+
+	if (queued < 0)
+		ublk_complete_io(q, tag, queued);
+
+	return 0;
+}
+
+static void ublk_loop_io_done(struct ublk_queue *q, int tag,
+		const struct io_uring_cqe *cqe)
+{
+	int cqe_tag = user_data_to_tag(cqe->user_data);
+
+	assert(tag == cqe_tag);
+	ublk_complete_io(q, tag, cqe->res);
+	q->io_inflight--;
+}
+
+static void ublk_loop_tgt_deinit(struct ublk_dev *dev)
+{
+	fsync(dev->fds[1]);
+	close(dev->fds[1]);
+}
+
+static int ublk_loop_tgt_init(struct ublk_dev *dev)
+{
+	char *file = dev->tgt.backing_file;
+	unsigned long long bytes;
+	struct stat st;
+	int fd;
+	struct ublk_params p = {
+		.types = UBLK_PARAM_TYPE_BASIC,
+		.basic = {
+			.logical_bs_shift	= 9,
+			.physical_bs_shift	= 12,
+			.io_opt_shift	= 12,
+			.io_min_shift	= 9,
+			.max_sectors = dev->dev_info.max_io_buf_bytes >> 9,
+		},
+	};
+
+	ublk_dbg(UBLK_DBG_DEV, "%s: file %s\n", __func__, file);
+
+	fd = open(file, O_RDWR);
+	if (fd < 0) {
+		ublk_err("%s: backing file %s can't be opened: %s\n",
+				__func__, file, strerror(errno));
+		return -EBADF;
+	}
+
+	if (fstat(fd, &st) < 0) {
+		close(fd);
+		return -EBADF;
+	}
+
+	if (!S_ISREG(st.st_mode))
+		return -EINVAL;
+
+	bytes = st.st_size;
+	dev->tgt.dev_size = bytes;
+	p.basic.dev_sectors = bytes >> 9;
+	dev->fds[1] = fd;
+	dev->nr_fds += 1;
+	dev->tgt.params = p;
+
+	return 0;
+}
+
 static const struct ublk_tgt_ops tgt_ops_list[] = {
 	{
 		.name = "null",
 		.init_tgt = ublk_null_tgt_init,
 		.queue_io = ublk_null_queue_io,
+	},
+	{
+		.name = "loop",
+		.init_tgt = ublk_loop_tgt_init,
+		.deinit_tgt = ublk_loop_tgt_deinit,
+		.queue_io = ublk_loop_queue_io,
+		.tgt_io_done = ublk_loop_io_done,
 	},
 };
 
@@ -1245,7 +1470,7 @@ static int __test_del_ublk_with_io(void)
 	int dev_id = -1;
 	int ret, pid;
 
-	ret = cmd_dev_add(tgt_type, &dev_id, 2, BUFFERS);
+	ret = cmd_dev_add(tgt_type, &dev_id, 2, BUFFERS, NULL);
 	if (ret != T_SETUP_OK) {
 		fprintf(stderr, "buffer reg failed: %d\n", ret);
 		return T_EXIT_FAIL;
@@ -1303,11 +1528,77 @@ static int test_del_ublk_with_io(void)
 	return T_EXIT_PASS;
 }
 
+static int test_ublk_with_loop_io(void)
+{
+	struct io_uring_params param;
+	struct io_uring ring;
+	int dev_id = -1;
+	char buf[256];
+	char *fname;
+	int ret;
+	struct io_ctx ctx = {
+		.seq = 1,
+		.verify = 1,
+	};
+
+	memset(&param, 0, sizeof(param));
+	ret = t_create_ring_params(16, &ring, &param);
+	if (ret == T_SETUP_SKIP)
+		return T_EXIT_SKIP;
+	else if (ret < 0)
+		return T_EXIT_FAIL;
+
+	/* ublk zc depends on SQE_GROUP features */
+	if (!(param.features & IORING_FEAT_SQE_GROUP))
+		return T_EXIT_SKIP;
+
+	srand((unsigned)time(NULL));
+	snprintf(buf, sizeof(buf), ".uring-cmd-ublk-loop-%u-%u",
+		(unsigned)rand(), (unsigned)getpid());
+	fname = buf;
+	t_create_file(fname, FILE_SIZE);
+
+	ret = cmd_dev_add("loop", &dev_id, 1, BUFFERS, fname);
+	if (ret != T_SETUP_OK) {
+		fprintf(stderr, "add ublk-loop failed: %d\n", ret);
+		return T_EXIT_FAIL;
+	}
+
+	/* write pattern to the whole created ublk block device */
+	ctx.dev_id = dev_id;
+	ctx.write = 1;
+	ret = test_io(&ctx);
+	if (ret != 0) {
+		ret = T_EXIT_FAIL;
+		goto fail;
+	}
+
+	/* read from ublk block device and check if data is expected */
+	ctx.write = 0;
+	ret = test_io(&ctx);
+	if (ret != 0) {
+		ret = T_EXIT_FAIL;
+		goto fail;
+	}
+
+	ret = T_EXIT_PASS;
+fail:
+	cmd_dev_del(dev_id, false);
+	unlink(fname);
+
+	return ret;
+}
+
 int main(int argc, char *argv[])
 {
+	int ret;
+
 	if (argc > 1)
 		return T_EXIT_SKIP;
 
+	ret = test_ublk_with_loop_io();
+	if (ret == T_EXIT_FAIL)
+		return ret;
 	return test_del_ublk_with_io();
 }
 #else
