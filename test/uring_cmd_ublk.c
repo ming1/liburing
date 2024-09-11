@@ -268,6 +268,15 @@ static int __ublk_ctrl_cmd(struct ublk_dev *dev,
 	return cqe->res;
 }
 
+static int ublk_ctrl_stop_dev(struct ublk_dev *dev)
+{
+	struct ublk_ctrl_cmd_data data = {
+		.cmd_op	= UBLK_CMD_STOP_DEV,
+	};
+
+	return __ublk_ctrl_cmd(dev, &data);
+}
+
 static int ublk_ctrl_start_dev(struct ublk_dev *dev,
 		int daemon_pid)
 {
@@ -907,7 +916,7 @@ fail:
 	return ret;
 }
 
-static int cmd_dev_del_by_kill(int number)
+static int cmd_dev_del(int number, bool by_kill)
 {
 	struct ublk_dev *dev;
 	int ret;
@@ -919,8 +928,15 @@ static int cmd_dev_del_by_kill(int number)
 	if (ret < 0)
 		goto fail;
 
-	/* simulate one ublk daemon panic */
-	kill(dev->dev_info.ublksrv_pid, 9);
+	if (by_kill) {
+		/* simulate one ublk daemon panic */
+		kill(dev->dev_info.ublksrv_pid, 9);
+	} else {
+		ret = ublk_ctrl_stop_dev(dev);
+		if (ret < 0)
+			ublk_err("%s: stop dev %d failed ret %d\n",
+					__func__, number, ret);
+	}
 
 	ret = ublk_stop_io_daemon(dev);
 	if (ret < 0)
@@ -1208,7 +1224,7 @@ static int test_del_ublk_with_io(void)
 		 * cancellable uring_cmd code path can be covered in this way.
 		 */
 		usleep(wait_ms * 1000);
-		ret = cmd_dev_del_by_kill(dev_id);
+		ret = cmd_dev_del(dev_id, true);
 		waitpid(pid, NULL, 0);
 		return ret;
 	}
