@@ -82,6 +82,8 @@ struct ublk_tgt_ops {
 
 struct ublk_tgt {
 	unsigned long dev_size;
+	unsigned int  sq_depth;
+	unsigned int  cq_depth;
 	const struct ublk_tgt_ops *ops;
 	struct ublk_params params;
 };
@@ -417,7 +419,7 @@ static int ublk_queue_init(struct ublk_queue *q)
 	int i, ret = -1;
 	int cmd_buf_size, io_buf_size;
 	unsigned long off;
-	int ring_depth = depth, cq_depth = depth;
+	int ring_depth = dev->tgt.sq_depth, cq_depth = dev->tgt.cq_depth;
 
 	q->tgt_ops = dev->tgt.ops;
 	q->state = 0;
@@ -882,6 +884,8 @@ static int cmd_dev_add(char *tgt_type, int *exp_id, unsigned nr_queues,
         info->nr_hw_queues = nr_queues;
         info->queue_depth = depth;
 	dev->tgt.ops = ops;
+	dev->tgt.sq_depth = depth;
+	dev->tgt.cq_depth = depth;
 
 	ret = ublk_ctrl_add_dev(dev);
 	if (ret < 0) {
