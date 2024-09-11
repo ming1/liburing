@@ -1194,7 +1194,7 @@ static int test_io_worker(int dev_id)
  *
  * Cover cancellable uring_cmd
  * */
-static int test_del_ublk_with_io(void)
+static int __test_del_ublk_with_io(void)
 {
 	const unsigned wait_ms = 200;
 	char *tgt_type = "null";
@@ -1230,15 +1230,12 @@ static int test_del_ublk_with_io(void)
 	}
 }
 
-int main(int argc, char *argv[])
+static int test_del_ublk_with_io(void)
 {
 	const int nr_loop = 4;
 	struct ublk_dev *dev;
 	__u64 features;
 	int ret, i;
-
-	if (argc > 1)
-		return T_EXIT_SKIP;
 
 	dev = ublk_ctrl_init();
 	/* ublk isn't supported or the module isn't loaded */
@@ -1254,11 +1251,20 @@ int main(int argc, char *argv[])
 		return T_EXIT_SKIP;
 
 	for (i = 0; i < nr_loop; i++) {
-		if (test_del_ublk_with_io())
+		if (__test_del_ublk_with_io())
 			return T_EXIT_FAIL;
 	}
 	ublk_ctrl_deinit(dev);
+
 	return T_EXIT_PASS;
+}
+
+int main(int argc, char *argv[])
+{
+	if (argc > 1)
+		return T_EXIT_SKIP;
+
+	return test_del_ublk_with_io();
 }
 #else
 int main(int argc, char *argv[])
