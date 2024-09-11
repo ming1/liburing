@@ -1022,8 +1022,8 @@ struct io_ctx {
 	pthread_t handle;
 };
 
-static int __test_io(struct io_uring *ring, int fd, int write,
-		int seq, struct iovec *vecs, int exp_len, off_t start)
+static int __test_io(struct io_uring *ring, int fd, struct io_ctx *ctx,
+		struct iovec *vecs, int exp_len, off_t start)
 {
 	struct io_uring_sqe *sqe;
 	struct io_uring_cqe *cqe;
@@ -1037,9 +1037,9 @@ static int __test_io(struct io_uring *ring, int fd, int write,
 			fprintf(stderr, "sqe get failed\n");
 			goto err;
 		}
-		if (!seq)
+		if (!ctx->seq)
 			offset = start + BS * (rand() % BUFFERS);
-		if (write) {
+		if (ctx->write) {
 			io_uring_prep_write_fixed(sqe, fd, vecs[i].iov_base,
 						  vecs[i].iov_len,
 						  offset, i);
@@ -1049,7 +1049,7 @@ static int __test_io(struct io_uring *ring, int fd, int write,
 						 offset, i);
 		}
 		sqe->user_data = i;
-		if (seq)
+		if (ctx->seq)
 			offset += BS;
 	}
 
@@ -1130,8 +1130,7 @@ static int test_io(struct io_ctx *ctx)
 	}
 
 	for (offset = 0; offset < bytes; offset += BS * BUFFERS) {
-		ret = __test_io(&ring, fd, ctx->write, ctx->seq, vecs, BS,
-				offset);
+		ret = __test_io(&ring, fd, ctx, vecs, BS, offset);
 		if (ret != T_SETUP_OK) {
 			fprintf(stderr, "/dev/ublkb%d read failed: offset %lu ret %d\n",
 					ctx->dev_id, (unsigned long) offset, ret);
