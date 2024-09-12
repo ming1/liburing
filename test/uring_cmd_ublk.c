@@ -1011,16 +1011,38 @@ static const struct ublk_tgt_ops *ublk_find_tgt(const char *name)
 #include "liburing.h"
 #define BS		4096
 #define BUFFERS		128
+#define FILE_SIZE       (8 * 1024 * 1024)
 
 struct io_ctx {
 	int dev_id;
 	int write;
 	int seq;
+	int verify;
 
 	/* output */
 	int res;
 	pthread_t handle;
 };
+
+static bool check_buf(const struct iovec *iov, off_t offset)
+{
+	unsigned int idx = 0;
+
+	for (idx = 0; idx < iov->iov_len; idx += sizeof(off_t)) {
+		if (*((off_t *)(iov->iov_base + idx)) != offset)
+			return false;
+	}
+	return true;
+}
+
+static void fill_pattern(const struct iovec *iov, off_t offset)
+{
+	unsigned int idx = 0;
+
+	for (idx = 0; idx < iov->iov_len; idx += sizeof(off_t)) {
+		*((off_t *)(iov->iov_base + idx)) = offset;
+	}
+}
 
 static int __test_io(struct io_uring *ring, int fd, struct io_ctx *ctx,
 		struct iovec *vecs, int exp_len, off_t start)
@@ -1029,6 +1051,11 @@ static int __test_io(struct io_uring *ring, int fd, struct io_ctx *ctx,
 	struct io_uring_cqe *cqe;
 	int i, ret;
 	off_t offset;
+
+	if (ctx->verify && !ctx->seq) {
+		fprintf(stderr, "only support verify for sequential IO\n");
+		goto err;
+	}
 
 	offset = start;
 	for (i = 0; i < BUFFERS; i++) {
@@ -1040,6 +1067,8 @@ static int __test_io(struct io_uring *ring, int fd, struct io_ctx *ctx,
 		if (!ctx->seq)
 			offset = start + BS * (rand() % BUFFERS);
 		if (ctx->write) {
+			if (ctx->verify)
+				fill_pattern(&vecs[i], offset);
 			io_uring_prep_write_fixed(sqe, fd, vecs[i].iov_base,
 						  vecs[i].iov_len,
 						  offset, i);
@@ -1059,6 +1088,7 @@ static int __test_io(struct io_uring *ring, int fd, struct io_ctx *ctx,
 		goto err;
 	}
 
+	/* wait until all are completed */
 	for (i = 0; i < BUFFERS; i++) {
 		ret = io_uring_wait_cqe(ring, &cqe);
 		if (ret) {
@@ -1078,6 +1108,17 @@ static int __test_io(struct io_uring *ring, int fd, struct io_ctx *ctx,
 			goto err;
 		}
 		io_uring_cqe_seen(ring, cqe);
+	}
+
+	/* verify for READ if required */
+	if (ctx->verify && !ctx->write) {
+		for (i = 0; i < BUFFERS; i++) {
+			if (!check_buf(&vecs[i], start + BS * i)) {
+				fprintf(stderr, "verify failed off %llu\n",
+						(unsigned long long)(start + BS * i));
+				goto err;
+			}
+		}
 	}
 
 	return 0;
