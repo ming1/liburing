@@ -72,9 +72,10 @@ struct ublk_io {
 #define UBLKSRV_NEED_FETCH_RQ		(1UL << 0)
 #define UBLKSRV_NEED_COMMIT_RQ_COMP	(1UL << 1)
 #define UBLKSRV_IO_FREE			(1UL << 2)
-	unsigned int flags;
+	unsigned short flags;
+	unsigned short refs;		/* used by target code only */
 
-	unsigned int result;
+	int result;
 };
 
 struct ublk_tgt_ops {
@@ -1062,14 +1063,47 @@ static inline void ublk_uring_prep_rw_zc(struct ublk_queue *q,
 	__u64 off = iod->start_sector << 9;
 	struct io_uring_sqe *lead;
 	struct io_uring_sqe *mem;
+	struct ublk_io *io = &q->ios[tag];
+	const unsigned front_len = 4096;
 
+	io->refs = 1;
+	io->result = 0;
 	q->io_inflight++;
+
+	/* test buffer split */
+	if (len > front_len)
+		len = front_len;
+
 	ublk_get_sqe_pair(&q->ring, &lead, &mem);
 
 	io_uring_prep_grp_lead(lead, dev_fd, tag, q_id);
 	io_uring_prep_rw_group(op, mem, fd, 0, len, off);
 	io_uring_sqe_set_flags(mem, IOSQE_FIXED_FILE | IOSQE_GROUP_KBUF);
 	mem->user_data = build_user_data(tag, ublk_op, 0, 1);
+
+	len = (iod->nr_sectors << 9) - len;
+	if (len > 0) {
+		struct io_uring_sqe *mem2 = io_uring_get_sqe(&q->ring);
+
+		/* don't split buffer in case of running out of sqe */
+		if (!mem2) {
+			len = iod->nr_sectors << 9;
+			io_uring_prep_rw_group(op, mem, fd, 0, len, off);
+			return;
+		}
+
+		/*
+		 * The 1st member consumers buffer size of `front_size`,
+		 * and the 2nd member consumes the remained bytes
+		 */
+		mem->flags |= IOSQE_GROUP_LINK;
+		io_uring_prep_rw_group(op, mem2, fd, front_len, len,
+				off + front_len);
+		io_uring_sqe_set_flags(mem2, IOSQE_FIXED_FILE | IOSQE_GROUP_KBUF);
+		mem2->user_data = build_user_data(tag, ublk_op, 0, 1);
+		q->io_inflight += 1;
+		io->refs += 1;
+	}
 }
 
 static inline void ublk_uring_prep_flush(struct ublk_queue *q,
@@ -1078,7 +1112,10 @@ static inline void ublk_uring_prep_flush(struct ublk_queue *q,
 {
 	unsigned ublk_op = ublksrv_get_op(iod);
 	struct io_uring_sqe *sqe;
+	struct ublk_io *io = &q->ios[tag];
 
+	io->refs = 1;
+	io->result = 0;
 	sqe = io_uring_get_sqe(&q->ring);
 	io_uring_prep_sync_file_range(sqe, fd,
 			iod->nr_sectors << 9,
@@ -1148,10 +1185,21 @@ static void ublk_loop_io_done(struct ublk_queue *q, int tag,
 		const struct io_uring_cqe *cqe)
 {
 	int cqe_tag = user_data_to_tag(cqe->user_data);
+	struct ublk_io *io = &q->ios[tag];
 
 	assert(tag == cqe_tag);
-	ublk_complete_io(q, tag, cqe->res);
 	q->io_inflight--;
+
+	if (cqe->res >= 0) {
+		if (io->result >= 0)
+			io->result += cqe->res;
+	} else {
+		if (io->result >= 0)
+			io->result = cqe->res;
+	}
+
+	if (--io->refs == 0)
+		ublk_complete_io(q, tag, io->result);
 }
 
 static void ublk_loop_tgt_deinit(struct ublk_dev *dev)
