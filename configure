@@ -433,6 +433,23 @@ if compile_prog "" "" "idtype_t"; then
 fi
 print_config "has_idtype_t" "$has_idtype_t"
 
+##########################################
+# Check libbpf support
+libbpf="no"
+cat > $TMPC << EOF
+#include <bpf/libbpf.h>
+#include <unistd.h>
+#include <stdio.h>
+void main(void)
+{
+	printf("%d", LIBBPF_STRICT_ALL);
+}
+EOF
+if compile_prog "" "" "libbpf"; then
+  libbpf="yes"
+fi
+print_config "libbpf support" "$libbpf"
+
 #############################################################################
 liburing_nolibc="no"
 if test "$use_libc" != "yes"; then
@@ -535,6 +552,9 @@ if test "$futexv" = "yes"; then
 fi
 if test "$ublk_header" = "yes"; then
   output_sym "CONFIG_HAVE_UBLK_HEADER"
+fi
+if test "$libbpf" = "yes"; then
+  output_sym "CONFIG_HAVE_LIBBPF"
 fi
 if test "$use_sanitizer" = "yes"; then
   output_sym "CONFIG_USE_SANITIZER"
