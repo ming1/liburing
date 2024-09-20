@@ -302,6 +302,16 @@ test_targets := $(patsubst %,%.t,$(test_targets))
 all_targets += $(test_targets)
 helpers = helpers.o
 
+ifdef CONFIG_HAVE_LIBBPF
+	bpf_exe := test_bpf.t
+	bpf_prog := bpf/simple.bpf.o
+	bpf_prog_src := bpf/progs/simple.c
+	test_targets += bpf_wrapper.sh
+	all_targets += $(bpf_exe) $(bpf_prog)
+	override LDFLAGS += -lbpf
+	override CPPFLAGS += -I./bpf/
+endif
+
 ifeq ($(CONFIG_USE_SANITIZER),y)
 	asan_test_targets := $(patsubst %.c,%,$(asan_test_srcs))
 	asan_test_targets := $(patsubst %.cc,%,$(asan_test_targets))
@@ -310,7 +320,7 @@ ifeq ($(CONFIG_USE_SANITIZER),y)
 	all_targets += $(asan_test_targets)
 endif
 
-all: $(test_targets) $(asan_test_targets)
+all: $(test_targets) $(asan_test_targets) $(bpf_exe)
 
 helpers.o: helpers.c
 	$(QUIET_CC)$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ -c $<
@@ -318,6 +328,12 @@ helpers.o: helpers.c
 LIBURING := $(shell if [ -e ../src/liburing.a ]; then echo ../src/liburing.a; fi)
 
 %.t: %.c $(helpers) helpers.h $(LIBURING)
+	$(QUIET_CC)$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(helpers) $(LDFLAGS)
+
+${bpf_prog}: ${bpf_prog_src}
+	make -C bpf/
+
+$(bpf_exe): test_bpf.c $(helpers) helpers.h $(LIBURING) ${bpf_prog}
 	$(QUIET_CC)$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(helpers) $(LDFLAGS)
 
 #
@@ -345,6 +361,7 @@ uninstall:
 clean:
 	@rm -f $(all_targets) helpers.o output/*
 	@rm -rf output/
+	@make -C bpf clean
 
 runtests: all
 	@./runtests.sh $(test_targets) $(asan_test_targets)
