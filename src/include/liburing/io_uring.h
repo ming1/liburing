@@ -124,6 +124,7 @@ enum io_uring_sqe_flags_bit {
 	IOSQE_ASYNC_BIT,
 	IOSQE_BUFFER_SELECT_BIT,
 	IOSQE_CQE_SKIP_SUCCESS_BIT,
+	IOSQE_GROUP_LINK_BIT,
 };
 
 /*
@@ -143,6 +144,8 @@ enum io_uring_sqe_flags_bit {
 #define IOSQE_BUFFER_SELECT	(1U << IOSQE_BUFFER_SELECT_BIT)
 /* don't post CQE if request succeeded */
 #define IOSQE_CQE_SKIP_SUCCESS	(1U << IOSQE_CQE_SKIP_SUCCESS_BIT)
+/* SQE grouping */
+#define IOSQE_GROUP_LINK	(1U << IOSQE_GROUP_LINK_BIT)
 
 /*
  * io_uring_setup() flags
@@ -199,6 +202,9 @@ enum io_uring_sqe_flags_bit {
  * Removes indirection through the SQ index array.
  */
 #define IORING_SETUP_NO_SQARRAY		(1U << 16)
+
+/* Use hybrid poll in iopoll process */
+#define IORING_SETUP_HYBRID_IOPOLL	(1U << 17)
 
 enum io_uring_op {
 	IORING_OP_NOP,
@@ -361,7 +367,7 @@ enum io_uring_op {
  *				result 	will be the number of buffers send, with
  *				the starting buffer ID in cqe->flags as per
  *				usual for provided buffer usage. The buffers
- *				will be contiguous from the starting buffer ID.
+ *				will be	contigious from the starting buffer ID.
  */
 #define IORING_RECVSEND_POLL_FIRST	(1U << 0)
 #define IORING_RECV_MULTISHOT		(1U << 1)
@@ -416,12 +422,15 @@ enum io_uring_msg_ring_flags {
  * IORING_NOP_INJECT_RESULT	Inject result from sqe->result
  */
 #define IORING_NOP_INJECT_RESULT	(1U << 0)
+#define IORING_NOP_FILE			(1U << 1)
+#define IORING_NOP_FIXED_FILE		(1U << 2)
+#define IORING_NOP_FIXED_BUFFER		(1U << 3)
 
 /*
  * IO completion data structure (Completion Queue Entry)
  */
 struct io_uring_cqe {
-	__u64	user_data;	/* sqe->user_data submission passed back */
+	__u64	user_data;	/* sqe->user_data value passed back */
 	__s32	res;		/* result code for this event */
 	__u32	flags;
 
@@ -555,6 +564,7 @@ struct io_uring_params {
 #define IORING_FEAT_REG_REG_RING	(1U << 13)
 #define IORING_FEAT_RECVSEND_BUNDLE	(1U << 14)
 #define IORING_FEAT_MIN_TIMEOUT		(1U << 15)
+#define IORING_FEAT_SQE_GROUP		(1U << 16)
 
 /*
  * io_uring_register(2) opcodes and arguments
@@ -613,8 +623,15 @@ enum io_uring_register_op {
 	/* clone registered buffers from source ring to current ring */
 	IORING_REGISTER_CLONE_BUFFERS		= 30,
 
+	/* send MSG_RING without having a ring */
+	IORING_REGISTER_SEND_MSG_RING		= 31,
+
+	/* 32 reserved for zc rx */
+
+	/* resize CQ ring */
 	IORING_REGISTER_RESIZE_RINGS		= 33,
 
+	/* register fixed io_uring_reg_wait arguments */
 	IORING_REGISTER_CQWAIT_REG		= 34,
 
 	/* this goes last */
@@ -703,13 +720,17 @@ struct io_uring_clock_register {
 };
 
 enum {
-	IORING_REGISTER_SRC_REGISTERED = 1,
+	IORING_REGISTER_SRC_REGISTERED	= (1U << 0),
+	IORING_REGISTER_DST_REPLACE	= (1U << 1),
 };
 
 struct io_uring_clone_buffers {
 	__u32	src_fd;
 	__u32	flags;
-	__u32	pad[6];
+	__u32	src_off;
+	__u32	dst_off;
+	__u32	nr;
+	__u32	pad[3];
 };
 
 struct io_uring_buf {
@@ -731,7 +752,7 @@ struct io_uring_buf_ring {
 			__u16	resv3;
 			__u16	tail;
 		};
-		struct io_uring_buf	bufs[0];
+		__DECLARE_FLEX_ARRAY(struct io_uring_buf, bufs);
 	};
 };
 
