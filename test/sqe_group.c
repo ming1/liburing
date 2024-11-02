@@ -58,9 +58,9 @@ static void build_nop_group(struct io_uring *ring, struct test_data *d)
 	sqe->user_data = d->off + 2;
 	sqe->flags |= d->lead_flags;
 	if (d->sqe_grp)
-		sqe->flags |= IOSQE_SQE_GROUP;
+		sqe->flags |= IOSQE_GROUP_LINK;
 	else
-		sqe->flags &= ~IOSQE_SQE_GROUP;
+		sqe->flags &= ~IOSQE_GROUP_LINK;
 	if (d->fail_leader)
 		fail_nop_sqe(sqe);
 
@@ -68,9 +68,9 @@ static void build_nop_group(struct io_uring *ring, struct test_data *d)
 	sqe1->user_data = d->off + 0;
 	sqe1->flags |= d->mem_flags;
 	if (d->sqe_grp)
-		sqe1->flags |= IOSQE_SQE_GROUP;
+		sqe1->flags |= IOSQE_GROUP_LINK;
 	else
-		sqe1->flags &= ~IOSQE_SQE_GROUP;
+		sqe1->flags &= ~IOSQE_GROUP_LINK;
 	if (d->fail_member)
 		fail_nop_sqe(sqe1);
 
@@ -78,7 +78,7 @@ static void build_nop_group(struct io_uring *ring, struct test_data *d)
 	sqe2->user_data = d->off + 1;
 	sqe2->flags |= d->mem_flags;
 	if (!d->sqe_grp)
-		sqe2->flags &= ~IOSQE_SQE_GROUP;
+		sqe2->flags &= ~IOSQE_GROUP_LINK;
 
 	if (!(d->lead_flags & IOSQE_CQE_SKIP_SUCCESS))
 		nr += 1;
