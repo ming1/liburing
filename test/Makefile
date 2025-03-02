@@ -276,6 +276,21 @@ test_targets := $(patsubst %,%.t,$(test_targets))
 all_targets += $(test_targets)
 helpers = helpers.o
 
+ifdef CONFIG_HAVE_UBLK_HEADER
+ublk_target := ublk/test_stress_02.sh
+ublk_exec := ublk/kublk
+ublk_install := $(ublk_target) $(ublk_exec) ublk/test_common.sh
+test_targets += $(ublk_target)
+ublk_srcs = $(wildcard ublk/*.c)
+ublk_objs = $(ublk_srcs:.c=.o)
+override CFLAGS += -I./ublk/
+
+$(ublk_exec): $(ublk_objs)
+	$(QUIET_CC)$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+%.o: $(ublk)/%.c
+	$(QUIET_CC)$(CC) $(CPPFLAGS) $(CFLAGS) -I./ublk/ -c -o $@ $<
+endif
+
 ifeq ($(CONFIG_USE_SANITIZER),y)
 	asan_test_targets := $(patsubst %.c,%,$(asan_test_srcs))
 	asan_test_targets := $(patsubst %.cc,%,$(asan_test_targets))
@@ -284,7 +299,7 @@ ifeq ($(CONFIG_USE_SANITIZER),y)
 	all_targets += $(asan_test_targets)
 endif
 
-all: $(test_targets) $(asan_test_targets)
+all: $(test_targets) $(asan_test_targets) $(ublk_exec)
 
 helpers.o: helpers.c
 	$(QUIET_CC)$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ -c $<
@@ -312,6 +327,7 @@ install: $(test_targets) runtests.sh runtests-loop.sh
 	$(INSTALL) -D -m 755 $(test_targets) $(datadir)/liburing-test/
 	$(INSTALL) -D -m 755 runtests.sh  $(datadir)/liburing-test/
 	$(INSTALL) -D -m 755 runtests-loop.sh  $(datadir)/liburing-test/
+	$(INSTALL) -D -m 755 $(ublk_install)  $(datadir)/liburing-test/
 
 uninstall:
 	@rm -rf $(datadir)/liburing-test/
@@ -319,6 +335,7 @@ uninstall:
 clean:
 	@rm -f $(all_targets) helpers.o output/*
 	@rm -rf output/
+	@rm -f ublk/*.o ublk/kublk
 
 runtests: all
 	@./runtests.sh $(test_targets) $(asan_test_targets)

@@ -69,6 +69,7 @@ run_test()
 	local test_exec=("./$test_name")
 	local test_string="$test_name"
 	local out_name="$test_name"
+	local test_dir
 
 	# Specify test string to print
 	if [ -n "$dev" ]; then
@@ -135,6 +136,12 @@ run_test()
 		else
 			echo "$T_DIFF sec"
 		fi
+
+		test_dir=$(dirname "$out_name")
+		if [ "$test_dir" != "." ]; then
+			mkdir -p output/"$test_dir"
+		fi
+
 		echo $T_DIFF > "output/$out_name"
 	fi
 }

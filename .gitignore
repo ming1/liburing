@@ -32,6 +32,7 @@
 /test/*.t
 /test/*.dmesg
 /test/output/
+/test/ublk/kublk
 
 # Clang's compilation database file and directory.
 /.cache
