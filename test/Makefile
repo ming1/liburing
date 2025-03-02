@@ -233,7 +233,6 @@ test_srcs := \
 	truncate.c \
 	tty-write-dpoll.c \
 	unlink.c \
-	uring_cmd_ublk.c \
 	version.c \
 	waitid.c \
 	wait-timeout.c \
