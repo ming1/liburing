@@ -74,6 +74,7 @@ struct io_uring_sqe {
 		__u32		install_fd_flags;
 		__u32		nop_flags;
 		__u32		pipe_flags;
+		__u32		bpf_op_flags;
 	};
 	__u64	user_data;	/* data to be passed back at completion time */
 	/* pack this to avoid bogus arm OABI complaints */
@@ -217,6 +218,11 @@ enum io_uring_sqe_flags_bit {
  */
 #define IORING_SETUP_SQE_MIXED		(1U << 19)
 
+/*
+ * Allow to submit bpf IO
+ */
+#define IORING_SETUP_BPF		(1U << 20)
+
 enum io_uring_op {
 	IORING_OP_NOP,
 	IORING_OP_READV,
@@ -283,6 +289,7 @@ enum io_uring_op {
 	IORING_OP_PIPE,
 	IORING_OP_NOP128,
 	IORING_OP_URING_CMD128,
+	IORING_OP_BPF,
 
 	/* this goes last, obviously */
 	IORING_OP_LAST,
@@ -396,6 +403,54 @@ enum io_uring_op {
 #define IORING_SEND_ZC_REPORT_USAGE	(1U << 3)
 #define IORING_RECVSEND_BUNDLE		(1U << 4)
 #define IORING_SEND_VECTORIZED		(1U << 5)
+
+/*
+ * sqe->bpf_op_flags layout (32 bits total):
+ *   Bits 31-24: BPF operation ID (8 bits, 256 possible operations)
+ *   Bits 23-21: Buffer 1 type (3 bits: none/plain/fixed/reserved)
+ *   Bits 20-18: Buffer 2 type (3 bits: none/plain/reserved)
+ *   Bits 17-0:  Custom BPF flags (18 bits, available for BPF programs)
+ *
+ * For IORING_OP_BPF, buffers are specified as follows:
+ *   Buffer 1 (plain):  addr=sqe->addr, len=sqe->len
+ *   Buffer 1 (fixed):  index=sqe->buf_index, offset=sqe->addr, len=sqe->len
+ *   Buffer 2 (plain):  addr=sqe->addr3, len=sqe->optlen
+ *
+ * Note: Buffer 1 can be none/plain/fixed. Buffer 2 can only be none/plain.
+ *       3-bit encoding for each buffer allows for future expansion to 8 types (0-7).
+ *       Currently only one fixed buffer per request is supported (buffer 1).
+ *       Valid combinations: 0 buffers, 1 plain, 1 fixed, 2 plain, 1 fixed + 1 plain.
+ */
+#define IORING_BPF_OP_BITS	(8)
+#define IORING_BPF_OP_SHIFT	(24)
+
+/* Buffer type encoding in sqe->bpf_op_flags */
+#define IORING_BPF_BUF1_TYPE_SHIFT	(21)
+#define IORING_BPF_BUF2_TYPE_SHIFT	(18)
+#define IORING_BPF_BUF_TYPE_NONE	(0)	/* No buffer */
+#define IORING_BPF_BUF_TYPE_PLAIN	(1)	/* Plain user buffer */
+#define IORING_BPF_BUF_TYPE_FIXED	(2)	/* Fixed/registered buffer */
+#define IORING_BPF_BUF_TYPE_MASK	(7)	/* 3-bit mask */
+
+/* Helper macros to encode/decode buffer types */
+#define IORING_BPF_BUF1_TYPE(flags) \
+	(((flags) >> IORING_BPF_BUF1_TYPE_SHIFT) & IORING_BPF_BUF_TYPE_MASK)
+#define IORING_BPF_BUF2_TYPE(flags) \
+	(((flags) >> IORING_BPF_BUF2_TYPE_SHIFT) & IORING_BPF_BUF_TYPE_MASK)
+#define IORING_BPF_SET_BUF1_TYPE(type) \
+	(((type) & IORING_BPF_BUF_TYPE_MASK) << IORING_BPF_BUF1_TYPE_SHIFT)
+#define IORING_BPF_SET_BUF2_TYPE(type) \
+	(((type) & IORING_BPF_BUF_TYPE_MASK) << IORING_BPF_BUF2_TYPE_SHIFT)
+
+/* Custom BPF flags mask (18 bits available, bits 17-0) */
+#define IORING_BPF_CUSTOM_FLAGS_MASK	((1U << 18) - 1)
+
+/* Encode all components into sqe->bpf_op_flags */
+#define IORING_BPF_OP_FLAGS(op, buf1_type, buf2_type, flags) \
+	(((op) << IORING_BPF_OP_SHIFT) | \
+	 IORING_BPF_SET_BUF1_TYPE(buf1_type) | \
+	 IORING_BPF_SET_BUF2_TYPE(buf2_type) | \
+	 ((flags) & IORING_BPF_CUSTOM_FLAGS_MASK))
 
 /*
  * cqe.res for IORING_CQE_F_NOTIF if
@@ -597,6 +652,7 @@ struct io_uring_params {
 #define IORING_FEAT_MIN_TIMEOUT		(1U << 15)
 #define IORING_FEAT_RW_ATTR		(1U << 16)
 #define IORING_FEAT_NO_IOWAIT		(1U << 17)
+#define IORING_FEAT_BPF			(1U << 18)
 
 /*
  * io_uring_register(2) opcodes and arguments
