@@ -203,4 +203,121 @@ struct uring_bpf_ops memory_alloc_bpf_ops_4 = {
 	.issue_fn = (void *)uring_bpf_memory_alloc_issue,
 };
 
+/* Helper to perform a single memcpy with specified offset and length */
+__always_inline static int __do_memcpy(struct uring_bpf_data *data,
+					__u8 src_buf_id, __u8 dst_buf_id,
+					unsigned offset, unsigned len)
+{
+	struct bpf_req_mem_desc src_desc = {};
+	struct bpf_req_mem_desc dst_desc = {};
+	int ret;
+
+	/* Initialize buffer descriptors */
+	src_desc.buf_id = src_buf_id;
+	src_desc.offset = offset;
+	dst_desc.buf_id = dst_buf_id;
+	dst_desc.offset = offset;
+
+	BPF_DBG("memcpy src_buf_id=%u dst_buf_id=%u offset=%u len=%u\n",
+		src_desc.buf_id, dst_desc.buf_id, offset, len);
+
+	/* Call the kfunc to perform the memcpy */
+	ret = io_uring_bpf_req_memcpy(data, &dst_desc, &src_desc, len);
+
+	BPF_DBG("memcpy returned %d\n", ret);
+
+	return ret;
+}
+
+/* Common helper for memcpy operations - tests partial copies */
+__always_inline static int do_memcpy(struct uring_bpf_data *data,
+				     __u8 src_buf_id, __u8 dst_buf_id)
+{
+	unsigned total_len, first_len, remainder;
+	int ret, total_ret = 0;
+
+	/* Use the minimum of buf1_len and buf2_len */
+	total_len = data->buf1_len;
+	if (total_len > data->buf2_len)
+		total_len = data->buf2_len;
+
+	/* First copy: min(total_len, 512) bytes */
+	first_len = total_len;
+	if (first_len > 512)
+		first_len = 512;
+
+	/* Perform first copy */
+	ret = __do_memcpy(data, src_buf_id, dst_buf_id, 0, first_len);
+	if (ret < 0)
+		return ret;
+
+	total_ret = ret;
+
+	/* Second copy: remainder if there is any */
+	if (total_len > total_ret) {
+		remainder = total_len - total_ret;
+
+		/* Perform second copy with adjusted offset */
+		ret = __do_memcpy(data, src_buf_id, dst_buf_id, total_ret, remainder);
+		if (ret < 0)
+			return ret;
+
+		total_ret += ret;
+	}
+
+	BPF_DBG("memcpy total returned %d\n", total_ret);
+
+	return total_ret;
+}
+
+SEC("struct_ops/io_bpf_prep_io")
+int BPF_PROG(uring_bpf_memcpy_prep, struct uring_bpf_data *data, const struct io_uring_sqe *sqe)
+{
+	BPF_DBG("%s\n", __func__);
+	return 0;
+}
+
+SEC("struct_ops/io_bpf_issue_io")
+int BPF_PROG(uring_bpf_memcpy_issue, struct uring_bpf_data *data)
+{
+	int ret;
+
+	/* Copy from buffer 1 to buffer 2 */
+	ret = do_memcpy(data, 1, 2);
+	uring_bpf_set_result(data, ret);
+	return 0;
+}
+
+SEC(".struct_ops.link")
+struct uring_bpf_ops memcpy_bpf_ops_5 = {
+	.id = 5,
+	.prep_fn = (void *)uring_bpf_memcpy_prep,
+	.issue_fn = (void *)uring_bpf_memcpy_issue,
+};
+
+SEC("struct_ops/io_bpf_prep_io")
+int BPF_PROG(uring_bpf_memcpy_reverse_prep, struct uring_bpf_data *data, const struct io_uring_sqe *sqe)
+{
+	BPF_DBG("%s\n", __func__);
+	return 0;
+}
+
+SEC("struct_ops/io_bpf_issue_io")
+int BPF_PROG(uring_bpf_memcpy_reverse_issue, struct uring_bpf_data *data)
+{
+	int ret;
+
+	/* Copy from buffer 2 to buffer 1 */
+	ret = do_memcpy(data, 2, 1);
+	uring_bpf_set_result(data, ret);
+	return 0;
+}
+
+SEC(".struct_ops.link")
+struct uring_bpf_ops memcpy_reverse_bpf_ops_6 = {
+	.id = 6,
+	.prep_fn = (void *)uring_bpf_memcpy_reverse_prep,
+	.issue_fn = (void *)uring_bpf_memcpy_reverse_issue,
+};
+
 char LICENSE[] SEC("license") = "GPL";
